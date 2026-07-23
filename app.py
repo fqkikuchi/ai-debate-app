@@ -16,7 +16,7 @@ if not api_key:
 
 # 最新のGoogle GenAI SDK初期化
 client = genai.Client(api_key=api_key)
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.6-flash"
 
 # 入力フォーム
 topic = st.text_input("検討したいテーマやアイデアを入力してください:", placeholder="例：地方でAIを使ったSNS運用代行副業は稼げる？")
@@ -46,8 +46,8 @@ if st.button("🚀 議論を開始する", type="primary"):
             提案役の主張:
             {proposer_text}
 
-            あなたは意地悪な投資家であり、「批判役（悪魔の代弁者）」です。
-            提案役の甘い見通し、市場過飽和のリスク、見落とされている競合や障壁を容赦なく徹底的に論破・批判してください。
+            あなたは徹底的な「批判役（悪魔の代弁者）」です。
+            提案役の甘い見通し、見落としているデメリットやリスク、実行する際の障壁や懸念点を、論理的かつ容赦なく指摘・批判してください。
             """
             res_critic = client.models.generate_content(model=MODEL_NAME, contents=prompt_critic)
             critic_text = res_critic.text
