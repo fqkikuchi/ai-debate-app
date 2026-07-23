@@ -1,46 +1,57 @@
 import os
+import io
 from google import genai
+from google.genai.errors import APIError
 import streamlit as st
+from PIL import Image
 
 # --------------------------------------------------
 # ページ初期設定
 # --------------------------------------------------
 st.set_page_config(
-    page_title="AIマルチエージェント討論",
+    page_title="AIマルチエージェント討論 (堅牢版)",
     page_icon="🤖",
     layout="wide"
 )
 st.title("🤖 AIマルチエージェント討論システム")
-st.caption("Geminiによる 提案役(肯定) vs 批判役(悪魔の代弁者) vs 審判役(統合) の徹底議論")
+st.caption("Gemini 2.0 Flashによる 提案役 vs 批判役 vs 審判役 の徹底議論")
 
-# APIキーの取得（Streamlit Secretsまたは環境変数から取得）
+# APIキーの取得
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
-    st.error("APIキーが設定されていません。StreamlitのSecretsまたは環境変数に GEMINI_API_KEY を設定してください。")
+    st.error("APIキーが設定されていません。環境変数またはStreamlit Secretsに GEMINI_API_KEY を設定してください。")
     st.stop()
 
-# 最新のGoogle GenAI SDK初期化
+# SDK初期化
 client = genai.Client(api_key=api_key)
-
-# モデルの指定（安定して動作する gemini-2.0-flash または gemini-1.5-flash を推奨）
 MODEL_NAME = "gemini-3.6-flash"
 
+# 画像リサイズ関数（トークン節約と高速化のため）
+def compress_image(image: Image.Image, max_size=(800, 800)) -> Image.Image:
+    img = image.copy()
+    img.thumbnail(max_size, Image.Resampling.LANCZOS)
+    return img
+
 # --------------------------------------------------
-# 入力フォーム領域（ご要望の複数行入力対応）
+# 入力フォーム領域
 # --------------------------------------------------
 topic = st.text_area(
     "検討したいテーマ、アイデア、文章の下書きなどを入力してください:",
-    placeholder=(
-        "【例1：ビジネスアイデア】\n"
-        "地方でAIを使ったSNS運用代行副業は稼げる？\n\n"
-        "【例2：ラブレター・文章チェック】\n"
-        "気になっている同僚に送りたいLINEメッセージの下書き：\n"
-        "「〇〇さん、今週もお疲れ様です！もしよかったら金曜の夜に新しくできたイタリアンに行きませんか？」"
-    ),
-    height=180,  # 一目で確認できるよう高さを確保
+    placeholder="例：この新商品のチラシデザイン案について、ターゲット層への訴求力を議論してください。",
+    height=150,
 )
 
-# セッション状態（結果保持用）の初期化
+uploaded_file = st.file_uploader(
+    "📷 画像・資料・デザイン案（任意・自動最適化されます）", 
+    type=["png", "jpg", "jpeg", "webp"]
+)
+
+processed_image = None
+if uploaded_file is not None:
+    raw_image = Image.open(uploaded_file)
+    processed_image = compress_image(raw_image) # 軽量化処理
+    st.image(processed_image, caption="添付画像（最適化済み）", width=300)
+
 if "discussion_result" not in st.session_state:
     st.session_state.discussion_result = None
 
@@ -48,84 +59,82 @@ if "discussion_result" not in st.session_state:
 # 議論実行処理
 # --------------------------------------------------
 if st.button("🚀 議論を開始する", type="primary"):
-    if not topic.strip():
-        st.warning("テーマや文章を入力してください。")
+    if not topic.strip() and processed_image is None:
+        st.warning("テーマを入力するか、画像をアップロードしてください。")
     else:
-        with st.status("🤖 AIエージェントたちが議論を進行中...", expanded=True) as status:
+        try:
+            with st.status("🤖 AIエージェントたちが議論を進行中...", expanded=True) as status:
 
-            # --- 1. 提案役（肯定派） ---
-            st.write("1/3 💡 提案役がポジティブな視点で分析・作成中...")
-            prompt_proposer = f"""
-            テーマ/入力文:
-            「{topic}」
+                # 画像がある場合はコンテンツリストに追加
+                def get_contents(prompt_text):
+                    if processed_image:
+                        return [prompt_text, processed_image]
+                    return [prompt_text]
 
-            あなたはこのアイデアや文章を成功させたい「熱心な提案役（肯定派）」です。
-            この内容の強み・メリット、具体的で現実的な実践方法、期待できる成果（ビジネスなら収益性や集客効果、個人的な文章・ラブレターなら相手への感情的アピールや成功率）を論理的かつ熱意を持って主張してください。
-            """
-            res_proposer = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt_proposer
-            )
-            proposer_text = res_proposer.text
+                # --- 1. 提案役（肯定派） ---
+                st.write("1/3 💡 提案役がポジティブな視点で分析中...")
+                prompt_proposer = f"""
+                テーマ/入力文: 「{topic}」
+                あなたはこのアイデアや文章、デザインを成功させたい「熱心な提案役（肯定派）」です。
+                この内容の強み、具体的で現実的な実践方法、期待できる成果を論理的かつ情熱的に主張してください。
+                （※画像がある場合は視覚的な強みも評価してください）
+                """
+                res_proposer = client.models.generate_content(
+                    model=MODEL_NAME, contents=get_contents(prompt_proposer)
+                )
+                proposer_text = res_proposer.text
 
-            # --- 2. 批判役（悪魔の代弁者） ---
-            st.write("2/3 ⚡ 批判役がリスクや盲点を徹底ツッコミ中...")
-            prompt_critic = f"""
-            テーマ/入力文:
-            「{topic}」
+                # --- 2. 批判役（悪魔の代弁者） ---
+                st.write("2/3 ⚡ 批判役がリスクや盲点を徹底ツッコミ中...")
+                prompt_critic = f"""
+                テーマ/入力文: 「{topic}」
+                【提案役の主張】:
+                {proposer_text}
 
-            【提案役の主張】:
-            {proposer_text}
+                あなたは徹底的な「批判役（悪魔の代弁者）」です。
+                提案役の甘い見通し、見落としているリスク、懸念点、画像上の欠点を論理的かつ容赦なく批判してください。
+                """
+                # 2回目以降はトークン節約のため、画像は含めずテキストのみで議論を深める（必要に応じて画像を含めることも可）
+                res_critic = client.models.generate_content(
+                    model=MODEL_NAME, contents=prompt_critic
+                )
+                critic_text = res_critic.text
 
-            あなたは徹底的な「批判役（悪魔の代弁者）」です。
-            提案役の甘い見通し、見落としているデメリットやリスク、実行・送信する際の障壁や懸念点を、論理的かつ容赦なく指摘・批判してください。
-            ※ラブレターや個人的メッセージの場合は「相手に引かれるリスク」「重すぎる/不自然な表現」「逆効果になるポイント」を中心に批判してください。
-            """
-            res_critic = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt_critic
-            )
-            critic_text = res_critic.text
+                # --- 3. 審判役（最終結論） ---
+                st.write("3/3 🏆 審判役が両者の意見を統合中...")
+                prompt_judge = f"""
+                テーマ/入力文: 「{topic}」
+                【提案役の主張】: {proposer_text}
+                【批判役の指摘】: {critic_text}
 
-            # --- 3. 審判役（最終結論） ---
-            st.write("3/3 🏆 審判役が両者の意見を統合し、最終解を導出中...")
-            prompt_judge = f"""
-            テーマ/入力文:
-            「{topic}」
+                あなたは優れた洞察力を持つ「審判（まとめ役）」です。
+                1. **【分析】提案の評価点 と 批判の重く受け止めるべき指摘**
+                2. **【改善の方向性】リスクを回避するためのポイント**
+                3. **【最終完成版・アクションプラン】** (ビジネスなら実行プラン、文章ならそのまま使える完成文)
+                をわかりやすく出力してください。
+                """
+                res_judge = client.models.generate_content(
+                    model=MODEL_NAME, contents=prompt_judge
+                )
+                judge_text = res_judge.text
 
-            【提案役の主張】:
-            {proposer_text}
+                status.update(label="✅ 議論が完了しました！", state="complete", expanded=False)
 
-            【批判役の指摘】:
-            {critic_text}
+            # セッション保存
+            st.session_state.discussion_result = {
+                "topic": topic,
+                "proposer": proposer_text,
+                "critic": critic_text,
+                "judge": judge_text,
+            }
 
-            あなたはずば抜けた洞察力を持つ「審判（まとめ役）」です。
-            提案役と批判役のやり取りを踏まえ、以下の項目を明快に出力してください。
-
-            1. **【分析】提案役の評価できる点 と 批判役の重く受け止めるべき指摘**
-            2. **【改善の方向性】リスクを回避し、目的を達成するためのポイント**
-            3. **【最終完成版・アクションプラン】**
-               - ビジネス/企画の場合：リスクを抑えた現実的な「実行アクションプラン」
-               - ラブレター/文章の場合：批判を踏まえてブラッシュアップした「そのまま使える最終完成文」
-            """
-            res_judge = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt_judge
-            )
-            judge_text = res_judge.text
-
-            status.update(label="✅ 議論が完了しました！", state="complete", expanded=False)
-
-        # 結果をセッションに保存（再描画時のデータ消失防止）
-        st.session_state.discussion_result = {
-            "topic": topic,
-            "proposer": proposer_text,
-            "critic": critic_text,
-            "judge": judge_text,
-        }
+        except APIError as e:
+            st.error(f"APIエラーが発生しました。時間を置いて再試行してください: {e}")
+        except Exception as e:
+            st.error(f"予期せぬエラーが発生しました: {e}")
 
 # --------------------------------------------------
-# 結果表示領域（タブ表示）
+# 結果表示領域
 # --------------------------------------------------
 if st.session_state.discussion_result:
     res = st.session_state.discussion_result
@@ -141,8 +150,6 @@ if st.session_state.discussion_result:
 
     with tab1:
         st.success(res["judge"])
-
-        # ダウンロード機能
         full_markdown = (
             f"# 検討テーマ:\n{res['topic']}\n\n"
             f"---\n## 🏆 最終結論・完成版\n{res['judge']}\n\n"
