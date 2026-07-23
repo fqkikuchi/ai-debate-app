@@ -23,7 +23,7 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 # モデルの指定（安定して動作する gemini-2.0-flash または gemini-1.5-flash を推奨）
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-3.6-flash"
 
 # --------------------------------------------------
 # 入力フォーム領域（ご要望の複数行入力対応）
