@@ -1,137 +1,218 @@
-import os
+from datetime import datetime
 import io
+import os
+import time
 from google import genai
+from google.genai import types
 from google.genai.errors import APIError
-import streamlit as st
 from PIL import Image
+import streamlit as st
 
 # --------------------------------------------------
 # ページ初期設定
 # --------------------------------------------------
 st.set_page_config(
-    page_title="AIマルチエージェント討論 (堅牢版)",
+    page_title="AIマルチエージェント討論 (プロダクト版)",
     page_icon="🤖",
-    layout="wide"
+    layout="wide",
 )
-st.title("🤖 AIマルチエージェント討論システム")
-st.caption("Gemini 2.0 Flashによる 提案役 vs 批判役 vs 審判役 の徹底議論")
+st.title("🤖 AIマルチエージェント討論システム (プロダクト版)")
+st.caption(
+    "Gemini 3.6 Flash による 💡提案役 vs ⚡批判役 vs ↩️反論 vs 🏆審判役 の4段階ディベート"
+)
 
-# APIキーの取得
-api_key = os.environ.get("GEMINI_API_KEY")
+# --------------------------------------------------
+# APIキーの取得（Secrets / 環境変数 / サイドバー）
+# --------------------------------------------------
+api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+
+with st.sidebar:
+    st.header("⚙️ 設定・操作")
+    if not api_key:
+        api_key = st.text_input(
+            "Gemini API Key を入力してください:", type="password"
+        )
+        st.caption(
+            "[Google AI Studio](https://aistudio.google.com/) で取得可能です。"
+        )
+
+    if st.button("🗑️ 画面と履歴をリセット", use_container_width=True):
+        st.session_state.discussion_result = None
+        st.rerun()
+
 if not api_key:
-    st.error("APIキーが設定されていません。環境変数またはStreamlit Secretsに GEMINI_API_KEY を設定してください。")
+    st.info("👈 サイドバーから Gemini API キーを設定してください。")
     st.stop()
 
 # SDK初期化
 client = genai.Client(api_key=api_key)
 MODEL_NAME = "gemini-3.6-flash"
 
-# 画像リサイズ関数（トークン節約と高速化のため）
+
+# --------------------------------------------------
+# ユーティリティ関数（堅牢性・セキュリティ対策）
+# --------------------------------------------------
 def compress_image(image: Image.Image, max_size=(800, 800)) -> Image.Image:
+    """画像の自動リサイズ（トークン節約＆軽量化）"""
     img = image.copy()
     img.thumbnail(max_size, Image.Resampling.LANCZOS)
     return img
 
+
+def sanitize_input(text: str) -> str:
+    """簡易インジェクション対策（入力のエスケープ処理）"""
+    return text.replace("```", "'''").strip()
+
+
+def call_gemini_with_retry(
+    contents, system_instruction: str, temperature: float, max_retries: int = 3
+):
+    """APIエラー時の指数バックオフ・リトライ処理"""
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=temperature,
+    )
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(
+                model=MODEL_NAME, contents=contents, config=config
+            )
+        except APIError as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(2**attempt)  # 1s, 2s, 4s のウェイト
+
+
 # --------------------------------------------------
 # 入力フォーム領域
 # --------------------------------------------------
-topic = st.text_area(
+topic_raw = st.text_area(
     "検討したいテーマ、アイデア、文章の下書きなどを入力してください:",
-    placeholder="例：この新商品のチラシデザイン案について、ターゲット層への訴求力を議論してください。",
-    height=150,
+    placeholder="例：新商品のチラシデザイン案について、ターゲット層への訴求力を議論してください。",
+    height=120,
 )
 
 uploaded_file = st.file_uploader(
-    "📷 画像・資料・デザイン案（任意・自動最適化されます）", 
-    type=["png", "jpg", "jpeg", "webp"]
+    "📷 画像・資料・デザイン案（任意・自動最適化）",
+    type=["png", "jpg", "jpeg", "webp"],
 )
 
 processed_image = None
 if uploaded_file is not None:
     raw_image = Image.open(uploaded_file)
-    processed_image = compress_image(raw_image) # 軽量化処理
-    st.image(processed_image, caption="添付画像（最適化済み）", width=300)
+    processed_image = compress_image(raw_image)
+    st.image(processed_image, caption="添付画像（最適化済み）", width=250)
 
 if "discussion_result" not in st.session_state:
     st.session_state.discussion_result = None
 
 # --------------------------------------------------
-# 議論実行処理
+# 議論実行処理 (4フェーズ・ディベート)
 # --------------------------------------------------
-if st.button("🚀 議論を開始する", type="primary"):
-    if not topic.strip() and processed_image is None:
+if st.button("🚀 討論を開始する", type="primary", use_container_width=True):
+    topic = sanitize_input(topic_raw)
+
+    if not topic and processed_image is None:
         st.warning("テーマを入力するか、画像をアップロードしてください。")
     else:
         try:
-            with st.status("🤖 AIエージェントたちが議論を進行中...", expanded=True) as status:
+            with st.status(
+                "🤖 AIエージェントたちがディベートを実行中...",
+                expanded=True,
+            ) as status:
 
-                # 画像がある場合はコンテンツリストに追加
-                def get_contents(prompt_text):
-                    if processed_image:
-                        return [prompt_text, processed_image]
-                    return [prompt_text]
+                # 画像添付ヘルパー
+                def build_contents(text_data):
+                    return (
+                        [processed_image, text_data]
+                        if processed_image
+                        else [text_data]
+                    )
 
-                # --- 1. 提案役（肯定派） ---
-                st.write("1/3 💡 提案役がポジティブな視点で分析中...")
-                prompt_proposer = f"""
-                テーマ/入力文: 「{topic}」
-                あなたはこのアイデアや文章、デザインを成功させたい「熱心な提案役（肯定派）」です。
-                この内容の強み、具体的で現実的な実践方法、期待できる成果を論理的かつ情熱的に主張してください。
-                （※画像がある場合は視覚的な強みも評価してください）
-                """
-                res_proposer = client.models.generate_content(
-                    model=MODEL_NAME, contents=get_contents(prompt_proposer)
+                # --- PHASE 1: 提案役（肯定派） ---
+                st.write("1/4 💡 【提案役】強みと推進案を構築中...")
+                sys_proposer = (
+                    "あなたはこのアイデアや企画を成功させたい「熱心な提案役（肯定派）」です。"
+                    "強み、具体的な実践方法、期待できる成果を論理的かつ情熱的に主張してください。"
                 )
-                proposer_text = res_proposer.text
-
-                # --- 2. 批判役（悪魔の代弁者） ---
-                st.write("2/3 ⚡ 批判役がリスクや盲点を徹底ツッコミ中...")
-                prompt_critic = f"""
-                テーマ/入力文: 「{topic}」
-                【提案役の主張】:
-                {proposer_text}
-
-                あなたは徹底的な「批判役（悪魔の代弁者）」です。
-                提案役の甘い見通し、見落としているリスク、懸念点、画像上の欠点を論理的かつ容赦なく批判してください。
-                """
-                # 2回目以降はトークン節約のため、画像は含めずテキストのみで議論を深める（必要に応じて画像を含めることも可）
-                res_critic = client.models.generate_content(
-                    model=MODEL_NAME, contents=prompt_critic
+                prompt_p1 = f"### 検討テーマ\n{topic}"
+                res_p1 = call_gemini_with_retry(
+                    build_contents(prompt_p1), sys_proposer, temperature=0.7
                 )
-                critic_text = res_critic.text
+                proposer_text = res_p1.text
 
-                # --- 3. 審判役（最終結論） ---
-                st.write("3/3 🏆 審判役が両者の意見を統合中...")
-                prompt_judge = f"""
-                テーマ/入力文: 「{topic}」
-                【提案役の主張】: {proposer_text}
-                【批判役の指摘】: {critic_text}
-
-                あなたは優れた洞察力を持つ「審判（まとめ役）」です。
-                1. **【分析】提案の評価点 と 批判の重く受け止めるべき指摘**
-                2. **【改善の方向性】リスクを回避するためのポイント**
-                3. **【最終完成版・アクションプラン】** (ビジネスなら実行プラン、文章ならそのまま使える完成文)
-                をわかりやすく出力してください。
-                """
-                res_judge = client.models.generate_content(
-                    model=MODEL_NAME, contents=prompt_judge
+                # --- PHASE 2: 批判役（悪魔の代弁者） ---
+                st.write("2/4 ⚡ 【批判役】リスクと欠点を徹底検証中...")
+                sys_critic = (
+                    "あなたは徹底的な「批判役（悪魔の代弁者）」です。"
+                    "提案役の見落としているリスク、甘い見通し、視覚的・構造的欠点を冷静かつ論理的に批判してください。"
                 )
-                judge_text = res_judge.text
+                prompt_c1 = f"### 検討テーマ\n{topic}\n\n### 提案役の主張\n{proposer_text}"
+                res_c1 = call_gemini_with_retry(
+                    build_contents(prompt_c1), sys_critic, temperature=0.2
+                )
+                critic_text = res_c1.text
 
-                status.update(label="✅ 議論が完了しました！", state="complete", expanded=False)
+                # --- PHASE 3: 提案役の反論（リバッタル） ---
+                st.write(
+                    "3/4 ↩️ 【提案役】批判に対する誤解の解明・対案（反論）を作成中..."
+                )
+                sys_rebuttal = (
+                    "あなたは提案役です。批判役からの指摘を受け止めつつ、"
+                    "不当な懸念への反論、または批判を吸収した「現実的な補足・対案」を提示してください。"
+                )
+                prompt_r1 = f"### 批判役の指摘\n{critic_text}"
+                res_r1 = call_gemini_with_retry(
+                    prompt_r1, sys_rebuttal, temperature=0.5
+                )
+                rebuttal_text = res_r1.text
+
+                # --- PHASE 4: 審判役（最終統合・アクションプラン） ---
+                st.write(
+                    "4/4 🏆 【審判役】すべての議論を統合し、最適解を策定中..."
+                )
+                sys_judge = (
+                    "あなたは公正な「審判（まとめ役）」です。"
+                    "提案、批判、反論のプロセスを精査し、リスクを最小化しつつ効果を最大化する【最終完成版】を作成してください。"
+                )
+                prompt_j1 = (
+                    f"### 検討テーマ\n{topic}\n\n"
+                    f"### 1. 提案役の最初の主張\n{proposer_text}\n\n"
+                    f"### 2. 批判役の指摘\n{critic_text}\n\n"
+                    f"### 3. 提案役の反論・補足\n{rebuttal_text}\n\n"
+                    "以下の構成で最終出力を作成してください：\n"
+                    "1. **【総合分析】議論の総括（受け止めるべき懸念と採用すべき強み）**\n"
+                    "2. **【改善ポイント】回避すべき致命的リスクと修正案**\n"
+                    "3. **【最終完成版・アクションプラン】**（そのまま使える完成テキスト、または実行プラン）"
+                )
+                # 審判フェーズはテキストのみでトークンと時間を節約
+                res_j1 = call_gemini_with_retry(
+                    prompt_j1, sys_judge, temperature=0.3
+                )
+                judge_text = res_j1.text
+
+                status.update(
+                    label="✅ 討論完了！最適化された結論が生成されました。",
+                    state="complete",
+                    expanded=False,
+                )
 
             # セッション保存
             st.session_state.discussion_result = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "topic": topic,
                 "proposer": proposer_text,
                 "critic": critic_text,
+                "rebuttal": rebuttal_text,
                 "judge": judge_text,
             }
 
         except APIError as e:
-            st.error(f"APIエラーが発生しました。時間を置いて再試行してください: {e}")
+            st.error(
+                f"🚨 Gemini APIエラーが発生しました。時間を置いて再試行してください: {e}"
+            )
         except Exception as e:
-            st.error(f"予期せぬエラーが発生しました: {e}")
+            st.error(f"🚨 予期せぬエラーが発生しました: {e}")
 
 # --------------------------------------------------
 # 結果表示領域
@@ -140,27 +221,38 @@ if st.session_state.discussion_result:
     res = st.session_state.discussion_result
 
     st.divider()
-    st.subheader("📊 議論結果")
+    st.subheader("📊 議論結果および最終完成版")
+    st.caption(f"実行日時: {res['timestamp']}")
 
-    tab1, tab2, tab3 = st.tabs([
-        "🏆 最終結論・完成版",
-        "💡 1. 提案役（肯定派）",
-        "⚡ 2. 批判役（悪魔の代弁者）"
-    ])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        [
+            "🏆 最終結論・完成版",
+            "💡 1. 提案（肯定）",
+            "⚡ 2. 批判（指摘）",
+            "↩️ 3. 反論（対案）",
+        ]
+    )
 
     with tab1:
         st.success(res["judge"])
+
+        # Markdownダウンロード用データの構築
         full_markdown = (
-            f"# 検討テーマ:\n{res['topic']}\n\n"
+            f"# AIマルチエージェント討論レポート\n"
+            f"実行日時: {res['timestamp']}\n\n"
+            f"## 検討テーマ\n{res['topic']}\n\n"
             f"---\n## 🏆 最終結論・完成版\n{res['judge']}\n\n"
-            f"---\n## 💡 提案役の主張\n{res['proposer']}\n\n"
-            f"---\n## ⚡ 批判役の指摘\n{res['critic']}"
+            f"---\n## 💡 1. 提案役の主張\n{res['proposer']}\n\n"
+            f"---\n## ⚡ 2. 批判役の指摘\n{res['critic']}\n\n"
+            f"---\n## ↩️ 3. 提案役の反論・補足\n{res['rebuttal']}\n"
         )
+
         st.download_button(
-            label="📝 議論結果をダウンロード (.md)",
+            label="📝 討論レポートをダウンロード (.md)",
             data=full_markdown,
-            file_name="discussion_result.md",
+            file_name=f"discussion_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
             mime="text/markdown",
+            use_container_width=True,
         )
 
     with tab2:
@@ -168,3 +260,6 @@ if st.session_state.discussion_result:
 
     with tab3:
         st.warning(res["critic"])
+
+    with tab4:
+        st.markdown(res["rebuttal"])
