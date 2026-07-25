@@ -70,7 +70,7 @@ def call_gemini_with_smart_retry(
         system_instruction=system_instruction,
         temperature=temperature,
         max_output_tokens=2000,
-        tools=[search_tool], # ← ここでGoogle検索を有効化
+        tools=[search_tool],
     )
     
     for attempt in range(max_retries):
@@ -142,8 +142,15 @@ if st.button("🚀 最新情報を踏まえて討論を開始する", type="prim
                 # --- PHASE 1: 提案役 ---
                 status.write("1/4 💡 【提案役】最新情報を調査しつつ、強みと推進案を構築中...")
                 sys_proposer = (
-                    "あなたはこのアイデアや企画を成功させたい「熱心な提案役」です。"
-                    "必要に応じてGoogle検索を利用し、最新の市場データやトレンドを踏まえて論理的に主張してください。"
+                    "あなたはこのアイデアを成功に導く提案役です。"
+                    "Google検索を活用し、最新データに基づいた論理的な主張を展開してください。\n\n"
+                    "【重要ルール】\n"
+                    "・挨拶、前置き、自己紹介などの無駄な言葉（Fluff）は一切排除してください。\n"
+                    "・文脈や重要なデータ、検索結果のファクトは絶対に省略しないでください。\n"
+                    "・ただし、冗長な文章は避け、以下の構造で情報の密度を高く出力してください。\n"
+                    "1. [コアとなる主張]\n"
+                    "2. [根拠となる最新データ/ファクト]\n"
+                    "3. [具体的な推進アプローチ]"
                 )
                 
                 contents_p1 = [processed_image, f"### 検討テーマ\n{topic}"] if processed_image else [f"### 検討テーマ\n{topic}"]
@@ -157,83 +164,4 @@ if st.button("🚀 最新情報を踏まえて討論を開始する", type="prim
                 # --- PHASE 2: 批判役 ---
                 status.write("2/4 ⚡ 【批判役】最新の競合状況やリスクを検証中...")
                 sys_critic = (
-                    "あなたは大局的な視点を持つ「批判役（悪魔の代弁者）」です。"
-                    "提案役の主張に対し、最新の動向や市場の懸念を踏まえて、見落としている致命的なリスクを3点以内で指摘してください。"
-                )
-                
-                prompt_c1 = f"### 検討テーマ\n{topic}\n\n### 提案役の主張\n{proposer_text}"
-                res_c1 = call_gemini_with_smart_retry(
-                    contents=[prompt_c1], system_instruction=sys_critic, temperature=0.2, status_container=status
-                )
-                critic_text = res_c1.text
-
-                manual_wait(BASE_WAIT, "批判役の指摘を精査しています", status)
-
-                # --- PHASE 3: 提案役の反論 ---
-                status.write("3/4 ↩️ 【提案役】批判に対する補足・現実的な対案を作成中...")
-                sys_rebuttal = (
-                    "あなたは提案役です。批判役の指摘を受け止めつつ、"
-                    "最新の状況に即した現実的な補足や対案を簡潔に提示してください。"
-                )
-                
-                prompt_r1 = f"### 批判役の指摘\n{critic_text}"
-                res_r1 = call_gemini_with_smart_retry(
-                    contents=[prompt_r1], system_instruction=sys_rebuttal, temperature=0.5, status_container=status
-                )
-                rebuttal_text = res_r1.text
-
-                manual_wait(BASE_WAIT, "最終判断の準備をしています", status)
-
-                # --- PHASE 4: 審判役 ---
-                status.write("4/4 🏆 【審判役】すべての議論と最新情報を統合し、最適解を策定中...")
-                sys_judge = (
-                    "あなたは公正な「審判（まとめ役）」です。"
-                    "提案、批判、反論、および最新の動向を総合的に精査し、リスクを最小化する【最終完成版】を作成してください。\n"
-                    "出力構成：\n1. **【総合分析（最新動向を踏まえて）】**\n2. **【回避すべきリスク】**\n3. **【最終完成版・アクションプラン】**"
-                )
-                
-                prompt_j1 = f"### 検討テーマ\n{topic}\n\n### 1. 提案\n{proposer_text}\n### 2. 批判\n{critic_text}\n### 3. 反論\n{rebuttal_text}"
-                res_j1 = call_gemini_with_smart_retry(
-                    contents=[prompt_j1], system_instruction=sys_judge, temperature=0.3, status_container=status
-                )
-                judge_text = res_j1.text
-
-                status.update(
-                    label="✅ 討論完了！最新情報を踏まえた結論が生成されました。",
-                    state="complete",
-                    expanded=False,
-                )
-
-            # セッション保存
-            st.session_state.discussion_result = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "topic": topic,
-                "proposer": proposer_text,
-                "critic": critic_text,
-                "rebuttal": rebuttal_text,
-                "judge": judge_text,
-            }
-
-        except APIError as e:
-            st.error(f"🚨 APIエラーにより処理を中断しました: {e}")
-        except Exception as e:
-            st.error(f"🚨 予期せぬエラーが発生しました: {e}")
-
-# --------------------------------------------------
-# 結果表示領域
-# --------------------------------------------------
-if st.session_state.discussion_result:
-    res = st.session_state.discussion_result
-    st.divider()
-    st.subheader("📊 議論結果および最終完成版")
-    st.caption(f"実行日時: {res['timestamp']}")
-
-    tab1, tab2, tab3, tab4 = st.tabs(["🏆 最終結論", "💡 提案", "⚡ 批判", "↩️ 反論"])
-    with tab1:
-        st.success(res["judge"])
-    with tab2:
-        st.info(res["proposer"])
-    with tab3:
-        st.warning(res["critic"])
-    with tab4:
-        st.markdown(res["rebuttal"])
+                    "あなたは鋭い視点を持つ
