@@ -24,7 +24,7 @@ st.caption(
 # --------------------------------------------------
 # APIキーの取得
 # --------------------------------------------------
-api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 
 with st.sidebar:
     st.header("⚙️ 設定・操作")
@@ -44,7 +44,6 @@ if not api_key:
 
 # SDK初期化
 client = genai.Client(api_key=api_key)
-
 MODEL_NAME = "gemini-3.6-flash"
 
 # --------------------------------------------------
@@ -145,9 +144,9 @@ if st.button("🚀 最新情報を踏まえて討論を開始する", type="prim
                     "あなたはこのアイデアを成功に導く提案役です。"
                     "Google検索を活用し、最新データに基づいた論理的な主張を展開してください。\n\n"
                     "【重要ルール】\n"
-                    "・挨拶、前置き、自己紹介などの無駄な言葉（Fluff）は一切排除してください。\n"
+                    "・挨拶、前置き、自己紹介などの無駄な言葉は一切排除してください。\n"
                     "・文脈や重要なデータ、検索結果のファクトは絶対に省略しないでください。\n"
-                    "・ただし、冗長な文章は避け、以下の構造で情報の密度を高く出力してください。\n"
+                    "・以下の構造で情報の密度を高く出力してください。\n"
                     "1. [コアとなる主張]\n"
                     "2. [根拠となる最新データ/ファクト]\n"
                     "3. [具体的な推進アプローチ]"
@@ -164,4 +163,110 @@ if st.button("🚀 最新情報を踏まえて討論を開始する", type="prim
                 # --- PHASE 2: 批判役 ---
                 status.write("2/4 ⚡ 【批判役】最新の競合状況やリスクを検証中...")
                 sys_critic = (
-                    "あなたは鋭い視点を持つ
+                    "あなたは鋭い視点を持つ批判役（リスクアナリスト）です。"
+                    "提案役の意見を踏まえ、Google検索で最新のリスク要因、競合状況、技術的・法的な課題を洗い出してください。\n\n"
+                    "【重要ルール】\n"
+                    "・挨拶や感情的な表現は避け、冷徹かつ論理的に反証してください。\n"
+                    "・以下の構造で出力してください。\n"
+                    "1. [提案の致命的な弱点・リスク]\n"
+                    "2. [それを裏付ける最新の競合・市場データ]\n"
+                    "3. [解決が困難なボトルネック]"
+                )
+                
+                contents_p2 = [f"### 検討テーマ\n{topic}\n\n### 提案役の意見\n{proposer_text}"]
+                res_p2 = call_gemini_with_smart_retry(
+                    contents=contents_p2, system_instruction=sys_critic, temperature=0.7, status_container=status
+                )
+                critic_text = res_p2.text
+                
+                manual_wait(BASE_WAIT, "批判役の意見をまとめています", status)
+
+                # --- PHASE 3: 反論・改善（提案役） ---
+                status.write("3/4 ↩️ 【反論役】批判に対する代替案や解決策を模索中...")
+                sys_rebutter = (
+                    "あなたは提案役のサポートに入り、批判役の指摘を乗り越える解決策を提示する反論役です。"
+                    "批判役の指摘事項をGoogle検索で深掘りし、それを克服する具体的な最新のアプローチを提案してください。\n\n"
+                    "【重要ルール】\n"
+                    "1. [批判の受容とピボット案]\n"
+                    "2. [リスクを軽減する最新技術/事例]\n"
+                    "3. [実現可能性を再定義する次のステップ]"
+                )
+                
+                contents_p3 = [
+                    f"### テーマ\n{topic}\n\n"
+                    f"### 提案役\n{proposer_text}\n\n"
+                    f"### 批判役からの指摘\n{critic_text}"
+                ]
+                res_p3 = call_gemini_with_smart_retry(
+                    contents=contents_p3, system_instruction=sys_rebutter, temperature=0.7, status_container=status
+                )
+                rebutter_text = res_p3.text
+                
+                manual_wait(BASE_WAIT, "反論役の意見をまとめています", status)
+
+                # --- PHASE 4: 審判役（サマリー） ---
+                status.write("4/4 🏆 【審判役】議論全体を俯瞰し、最終的な結論とネクストアクションを生成中...")
+                sys_judge = (
+                    "あなたはこれまでの議論を客観的に評価し、最終的な結論を下す審判役です。"
+                    "提案、批判、反論のすべてを統合し、実用的な結論を出してください。\n\n"
+                    "【重要ルール】\n"
+                    "・箇条書きを活用し、視覚的にわかりやすく出力してください。\n"
+                    "1. [議論のサマリー（争点）]\n"
+                    "2. [総合評価（Go or No-Go、あるいは条件付きGo）]\n"
+                    "3. [直近1ヶ月で取るべき具体的なアクションプラン]"
+                )
+                
+                contents_p4 = [
+                    f"### テーマ\n{topic}\n\n"
+                    f"### 提案\n{proposer_text}\n\n"
+                    f"### 批判\n{critic_text}\n\n"
+                    f"### 反論・解決策\n{rebutter_text}"
+                ]
+                res_p4 = call_gemini_with_smart_retry(
+                    contents=contents_p4, system_instruction=sys_judge, temperature=0.4, status_container=status
+                )
+                judge_text = res_p4.text
+
+                # セッションステートに保存
+                st.session_state.discussion_result = {
+                    "proposer": proposer_text,
+                    "critic": critic_text,
+                    "rebutter": rebutter_text,
+                    "judge": judge_text
+                }
+                
+                status.update(label="✅ 討論が完了しました！", state="complete", expanded=False)
+
+        except Exception as e:
+            st.error(f"エラーが発生しました: {e}")
+
+# --------------------------------------------------
+# 結果表示
+# --------------------------------------------------
+if st.session_state.discussion_result:
+    res = st.session_state.discussion_result
+    
+    st.markdown("---")
+    st.header("🗣️ 議論の結果")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        with st.container(border=True):
+            st.subheader("💡 提案役の主張")
+            st.write(res["proposer"])
+            
+        with st.container(border=True):
+            st.subheader("↩️ 反論・解決案 (提案役側)")
+            st.write(res["rebutter"])
+            
+    with col2:
+        with st.container(border=True):
+            st.subheader("⚡ 批判役の指摘")
+            st.write(res["critic"])
+            
+    st.markdown("---")
+    st.header("🏆 審判役の最終結論")
+    with st.container(border=True):
+        st.write(res["judge"])
+
