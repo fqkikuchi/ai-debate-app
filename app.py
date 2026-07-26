@@ -1,5 +1,7 @@
 from datetime import datetime
 import os
+import random
+import re
 import time
 from google import genai
 from google.genai import types
@@ -11,14 +13,14 @@ import streamlit as st
 # 1. ページ初期設定
 # --------------------------------------------------
 st.set_page_config(
-    page_title="AIマルチエージェント討論 (最新情報・グラウンディング対応)",
+    page_title="AIマルチエージェント討論 (Gemini 3.6 Flash高信頼版)",
     page_icon="🤖",
     layout="wide",
 )
 
-st.title("🤖 AIマルチエージェント討論システム (Gemini 3.6 Flash対応版)")
+st.title("🤖 AIマルチエージェント討論システム (Gemini 3.6 Flash高信頼版)")
 st.caption(
-    "💡提案役 vs ⚡批判役 vs ↩️反論役 vs 🏆審判役 による最新Web検索連携ディベート"
+    "💡提案役 vs ⚡批判役 vs ↩️反論役 vs 🏆審判役 | 自動リカバリ＆完全コード生成機能搭載"
 )
 
 # --------------------------------------------------
@@ -32,7 +34,6 @@ with st.sidebar:
         api_key = st.text_input("Gemini API Key を入力してください:", type="password")
         st.caption("[Google AI Studio](https://aistudio.google.com/) で取得可能です。")
 
-    # 使用モデルの設定
     selected_model = st.selectbox(
         "使用モデル",
         ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash", "カスタム入力"],
@@ -42,7 +43,8 @@ with st.sidebar:
     if selected_model == "カスタム入力":
         selected_model = st.text_input("モデル名を入力:", value="gemini-3.6-flash")
 
-    if st.button("🗑️ 画面と履歴をリセット", use_container_width=True):
+    st.markdown("---")
+    if st.button("🗑️ 画面と全履歴をリセット", use_container_width=True):
         st.session_state.discussion_result = {}
         st.session_state.topic_used = ""
         st.rerun()
@@ -55,7 +57,7 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 # --------------------------------------------------
-# 3. ユーティリティ関数
+# 3. ユーティリティ関数（堅牢なエラー処理・ジッター・補正）
 # --------------------------------------------------
 def compress_image(image: Image.Image, max_size=(600, 600)) -> Image.Image:
     """画像の圧縮（API送信サイズ最適化）"""
@@ -65,60 +67,89 @@ def compress_image(image: Image.Image, max_size=(600, 600)) -> Image.Image:
 
 def sanitize_input(text: str) -> str:
     """入力の安全性向上"""
-    return text.replace("'''", "'''").strip()
+    return text.strip()
 
-def call_gemini_with_smart_retry(
+def call_gemini_with_jitter_retry(
     contents,
     system_instruction: str,
     temperature: float,
     status_container,
     use_search: bool = False,
-    max_retries: int = 4
+    max_retries: int = 5,
+    base_wait: float = 2.0,
+    max_wait: float = 60.0
 ):
-    """Google検索ツール（グラウンディング）制御と自動リトライを統合したAPIコール関数"""
+    """フルジッター付き指数バックオフを搭載した超堅牢API呼出関数"""
 
     current_date = datetime.now().strftime("%Y年%m月%d日")
     context_header = (
         f"【最重要前提】本日は {current_date} です。"
-        f"現在、Geminiの最新モデル（Gemini 3.6 Flash等）や最新の環境が利用可能です。"
-        f"過去の知識に縛られず、常に最新の事実に基づいて思考・出力してください。\n\n"
+        f"現在、Geminiの最新モデル（Gemini 3.6 Flash等）が利用可能です。"
+        f"過去の固定概念に縛られず、常に最新の仕様・最善の実装に基づいて思考・出力してください。\n\n"
     )
     full_system_instruction = context_header + system_instruction
 
-    # 情報収集フェーズのみWeb検索を有効化（処理高速化・タイムアウト防止のため）
-    tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else []
+    tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else None
 
     config = types.GenerateContentConfig(
         system_instruction=full_system_instruction,
         temperature=temperature,
         max_output_tokens=8192,
-        tools=tools if tools else None,
+        tools=tools,
     )
 
     for attempt in range(max_retries):
         try:
-            return client.models.generate_content(
+            res = client.models.generate_content(
                 model=selected_model, contents=contents, config=config
             )
+            return res.text or "（応答が空でした。再試行してください。）"
         except APIError as e:
             error_msg = str(e)
-            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+            if any(code in error_msg for code in ["429", "RESOURCE_EXHAUSTED", "500", "502", "503", "504"]):
                 if attempt == max_retries - 1:
                     raise e
-                wait_time = 15 * (attempt + 1)
-                status_container.warning(f"⚠️ API制限を検知しました。{wait_time}秒待機して自動再開します（試行 {attempt+1}/{max_retries}）...")
-                time.sleep(wait_time)
+                # フルジッター付き指数バックオフ計算
+                exp_wait = min(max_wait, base_wait * (2 ** attempt))
+                actual_wait = random.uniform(1.0, exp_wait)
+
+                status_container.warning(
+                    f"⚠️ API混雑/制限を検知（試行 {attempt+1}/{max_retries}）。"
+                    f"{actual_wait:.1f}秒後に自動リトライします..."
+                )
+                time.sleep(actual_wait)
                 status_container.info("🔄 処理を再開します...")
             else:
                 raise e
+        except Exception as e:
+            raise e
+
+def merge_code_continuation(original_text: str, continuation_text: str) -> str:
+    """途切れ生成されたコードやテキストを自然に結合・構文修復する"""
+    clean_continuation = continuation_text.strip()
+
+    # 続きのテキストが ```python や ``` で始まっている場合の重複削除調整
+    if clean_continuation.startswith("```"):
+        lines = clean_continuation.split("\n")
+        if len(lines) > 1:
+            clean_continuation = "\n".join(lines[1:])
+
+    merged = original_text.rstrip() + "\n" + clean_continuation
+
+    # マークダウンコードブロックの閉じ漏れ補正（奇数個の場合は閉じる）
+    backtick_count = merged.count("```")
+    if backtick_count % 2 != 0:
+        merged += "\n```"
+
+    return merged
 
 # --------------------------------------------------
 # 4. メインUI (入力領域)
 # --------------------------------------------------
 topic_raw = st.text_area(
-    "検討したいテーマ、アイデア、解決したい課題を入力してください:",
-    placeholder="例：以下のPythonコードを改修し、エラーを解決してください。最終出力にはそのままコピペして動く完全な修正コードを含めてください。\n```python\n# コード\n```",
-    height=120,
+    "検討したいテーマ、アイデア、解決したい課題（プログラム修正依頼等）を入力してください:",
+    placeholder="例：以下のPythonコードで発生するエラーを修正し、そのままコピペで動作する完全なコードを作成してください。\n\n```python\n# 該当のコード\n```",
+    height=140,
 )
 
 uploaded_file = st.file_uploader(
@@ -139,141 +170,116 @@ if "topic_used" not in st.session_state:
     st.session_state.topic_used = ""
 
 # --------------------------------------------------
-# 5. 討論実行ロジック (段階的保存対応)
+# 5. 討論実行ロジック (段階的保存・状態保持対応)
 # --------------------------------------------------
-if st.button("🚀 最新情報を検索して討論を開始", type="primary", use_container_width=True):
+if st.button("🚀 最新情報を検索して討論＆コード生成を開始", type="primary", use_container_width=True):
     topic = sanitize_input(topic_raw)
 
     if not topic and processed_image is None:
         st.warning("テーマを入力するか、画像をアップロードしてください。")
     else:
         st.session_state.topic_used = topic
-        st.session_state.discussion_result = {}  # 画面リセット
+        st.session_state.discussion_result = {}  # 初期化
 
         try:
-            with st.status(
-                "🤖 AIエージェントたちが最新情報を検証しながら議論中...",
-                expanded=True,
-            ) as status:
+            with st.status("🤖 AIエージェントたちが検証・ディベート中...", expanded=True) as status:
 
                 # --- PHASE 1: 提案役 ---
-                status.write("1/4 💡 【提案役】最新事実・仕様を調査し提案を作成中...")
+                status.write("1/4 💡 【提案役】最新仕様を検索・調査し、アプローチを作成中...")
                 sys_proposer = (
                     "あなたはこの課題を解決へ導く提案役です。"
-                    "Google検索を活用し、ユーザーの本来の目的（動作するコードの作成や成果物出力等）を達成するための最新仕様・最善のアプローチを提示してください。\n"
+                    "Google検索を活用し、ユーザーの目的（動作するコードの作成や課題解決）を達成するための最新仕様・最善のアプローチを提示してください。\n"
                     "・前置きや挨拶は排除し、1. [コアとなる主張・方針], 2. [最新根拠/ファクト], 3. [具体的推進・実装アプローチ] で記述してください。"
                 )
-
                 contents_p1 = [processed_image, f"### 当初の目的と検討テーマ\n{topic}"] if processed_image else [f"### 当初の目的と検討テーマ\n{topic}"]
-                res_p1 = call_gemini_with_smart_retry(contents_p1, sys_proposer, 0.7, status, use_search=True)
-                st.session_state.discussion_result["proposer"] = res_p1.text
+                res_p1 = call_gemini_with_jitter_retry(contents_p1, sys_proposer, 0.7, status, use_search=True)
+                st.session_state.discussion_result["proposer"] = res_p1
 
                 # --- PHASE 2: 批判役 ---
-                status.write("2/4 ⚡ 【批判役】リスクやコードのバグ・潜在課題を検証中...")
+                status.write("2/4 ⚡ 【批判役】バグ、リスク、セキュリティ・互換性問題を検証中...")
                 sys_critic = (
-                    "あなたは鋭い視点を持つ批判役です。"
-                    "提案役の意見を踏まえ、Google検索で最新のリスク、仕様の互換性問題、セキュリティやパフォーマンス上の懸念を洗い出してください。\n"
-                    "・1. [提案・実装の弱点・リスク], 2. [裏付ける最新技術/競合データ], 3. [解決困難なボトルネック] で記述してください。"
+                    "あなたは鋭い視点を持つ批判役・リードQAエンジニアです。"
+                    "提案役の意見を踏まえ、Google検索で最新のリスク、仕様の互換性問題、セキュリティやパフォーマンス上の懸念、コードのバグを洗い出してください。\n"
+                    "・前置きは排除し、1. [提案・実装の弱点・リスク], 2. [裏付ける最新技術/非推奨仕様], 3. [解決困難なボトルネック] で記述してください。"
                 )
-
-                contents_p2 = [f"### 当初の目的と検討テーマ\n{topic}\n\n### 提案役の主張\n{st.session_state.discussion_result['proposer']}"]
-                res_p2 = call_gemini_with_smart_retry(contents_p2, sys_critic, 0.7, status, use_search=True)
-                st.session_state.discussion_result["critic"] = res_p2.text
+                contents_p2 = [
+                    f"### 当初の目的と検討テーマ\n{topic}\n\n"
+                    f"### 提案役の主張\n{st.session_state.discussion_result['proposer']}"
+                ]
+                res_p2 = call_gemini_with_jitter_retry(contents_p2, sys_critic, 0.7, status, use_search=True)
+                st.session_state.discussion_result["critic"] = res_p2
 
                 # --- PHASE 3: 反論役 ---
-                status.write("3/4 ↩️ 【反論役】批判を乗り越える解決策・コード改善策を策定中...")
+                status.write("3/4 ↩️ 【反論役】批判を克服する具体的な改善策・コード修正案を策定中...")
                 sys_rebutter = (
                     "あなたは提案役をサポートし、批判を克服する反論役です。"
                     "批判役の指摘を分析し、それを克服するための技術的解決策やコード修正の方針を具体的に提示してください。\n"
-                    "・1. [批判の受容とピボット案], 2. [リスクを軽減する最新実装工夫], 3. [成果物完成に向けた具体策] で記述してください。"
+                    "・前置きは排除し、1. [批判の受容とピボット案], 2. [リスクを軽減する最新実装工夫], 3. [成果物完成に向けた具体策] で記述してください。"
                 )
-
                 contents_p3 = [
                     f"### 当初の目的と検討テーマ\n{topic}\n\n"
                     f"### 提案役の主張\n{st.session_state.discussion_result['proposer']}\n\n"
                     f"### 批判役の指摘\n{st.session_state.discussion_result['critic']}"
                 ]
-                res_p3 = call_gemini_with_smart_retry(contents_p3, sys_rebutter, 0.5, status, use_search=False)
-                st.session_state.discussion_result["rebutter"] = res_p3.text
+                res_p3 = call_gemini_with_jitter_retry(contents_p3, sys_rebutter, 0.4, status, use_search=False)
+                st.session_state.discussion_result["rebutter"] = res_p3
 
                 # --- PHASE 4: 審判役 ---
-                status.write("4/4 🏆 【審判役】議論を総括し、完全版の成果物・コードを出力中...")
+                status.write("4/4 🏆 【審判役】議論を総括し、完全版成果物・コードを出力中...")
                 sys_judge = (
-                    "あなたは最高権威の審判役兼リードエンジニアです。これまでの議論を総合評価し、ユーザーが求める最終成果物を出力してください。\n\n"
+                    "あなたは最高権威の審判役兼リードアーキテクトです。これまでの議論を総合評価し、ユーザーが求める最終成果物を出力してください。\n\n"
                     "【絶対遵守ルール】\n"
-                    "ユーザーがコード修正、プログラム作成、コピペ可能な成果物を要求している場合は、"
-                    "解説だけで終わらせず、**途中省略なしでそのまま動く完全なコード**をコードブロック（```python等）を使って必ず全文記述してください。"
-                    "「...（省略）」や「〜を記述」といった省略表記は厳禁です。\n\n"
+                    "1. ユーザーがコード修正やプログラム作成を要求している場合は、解説だけで終わらせず、**途中省略なしでそのままコピペして動く完全なコード**をマークダウンのコードブロック（```python等）内に全文出力してください。\n"
+                    "2. 「...（省略）」や「〜は既存コードの通り」などの省略表記は絶対に禁止です。\n\n"
                     "【出力構成】\n"
-                    "1. [議論のサマリーと総合判定 (Go / No-Go / 条件付きGo)]\n"
-                    "2. [最終採用アーキテクチャ・解決策の説明]\n"
-                    "3. [完成版成果物・そのままコピペして使える完全なプログラムコード]"
+                    "1. [議論サマリーと判定 (Go / No-Go / 条件付きGo)]\n"
+                    "2. [採用した最終アーキテクチャ・修正ポイント]\n"
+                    "3. [完成版成果物（そのままコピペして使える完全なコード）]"
                 )
-
                 contents_p4 = [
                     f"### 【ユーザーの当初の目的・要望】\n{topic}\n\n"
                     f"### 【提案役の主張】\n{st.session_state.discussion_result['proposer']}\n\n"
                     f"### 【批判役の指摘】\n{st.session_state.discussion_result['critic']}\n\n"
                     f"### 【反論・解決案】\n{st.session_state.discussion_result['rebutter']}\n\n"
                     f"--- 命令 ---\n"
-                    f"上記の議論成果を反映し、ユーザーの「当初の目的・要望」を完璧に満足させる最終成果物を出力してください。"
-                    f"プログラムコードが要求されている場合は、省略のない完全に動作するコードを含めてください。"
+                    f"上記の議論成果を統合し、ユーザーの要求を満たす最終成果物を出力してください。"
+                    f"プログラムコードが必要な場合は、省略のない完全に動作するコードを含めてください。"
                 ]
-                res_p4 = call_gemini_with_smart_retry(contents_p4, sys_judge, 0.3, status, use_search=False)
-                st.session_state.discussion_result["judge"] = res_p4.text
+                res_p4 = call_gemini_with_jitter_retry(contents_p4, sys_judge, 0.2, status, use_search=False)
+                st.session_state.discussion_result["judge"] = res_p4
 
                 status.update(label="✅ 討論および成果物の生成が完了しました！", state="complete", expanded=False)
 
         except Exception as e:
             st.error(f"実行中にエラーが発生しました: {e}")
+            st.info("💡 途中のフェーズまで実行結果が生成されている場合、下部に表示されています。")
 
 # --------------------------------------------------
-# 6. 討論結果のUI描画と「続き生成」機能
+# 6. 討論結果のUI描画および自動復元・補完機能
 # --------------------------------------------------
 res = st.session_state.discussion_result
 
 if res:
-    st.markdown("---")
-    st.header("🗣️ 議論プロセス")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if "proposer" in res:
-            with st.container(border=True):
-                st.subheader("💡 提案役の主張")
-                st.markdown(res["proposer"])
-
-        if "rebutter" in res:
-            with st.container(border=True):
-                st.subheader("↩️ 反論・解決案 (提案役側)")
-                st.markdown(res["rebutter"])
-
-    with col2:
-        if "critic" in res:
-            with st.container(border=True):
-                st.subheader("⚡ 批判役の指摘")
-                st.markdown(res["critic"])
-
     if "judge" in res:
         st.markdown("---")
         st.header("🏆 審判役の最終結論・コピペ用成果物")
+        st.info("💡 ユーザーの要望に基づき統合された最終成果物・コードです。そのままコピーして利用可能です。")
+
         with st.container(border=True):
             st.markdown(res["judge"])
 
-        # 審判役の出力が途切れた場合の続き生成機能
+        # コード途切れ時の精密補完UI
         st.markdown("---")
-        if st.button("📝 結論やコードが途中で切れている場合、続きを生成する"):
+        if st.button("📝 コードや結論が途中で切れている場合、続きを生成して自動結合する"):
             try:
-                with st.status("🔄 審判役の続きを生成しています...", expanded=True) as status:
-                    # 末尾500文字を文脈として渡す
-                    last_text = res["judge"][-500:] if len(res["judge"]) > 500 else res["judge"]
+                with st.status("🔄 審判役の続きを生成し、構文修復中...", expanded=True) as status:
+                    last_context = res["judge"][-600:] if len(res["judge"]) > 600 else res["judge"]
 
-                    sys_judge_continue = (
+                    sys_continue = (
                         "あなたは審判役です。あなたの直前の出力がトークン制限により途中で切れてしまいました。\n"
                         "以下の【直前の出力末尾】から自然につながるように、途切れたコードやテキストの「完全な続き」のみを出力してください。\n"
-                        "※挨拶、前置き、既に記述した部分の重複は出力しないでください。コードの途中だった場合はインデントを維持してそのまま書き直してください。\n\n"
-                        f"【直前の出力末尾】\n{last_text}"
+                        "※前置き、挨拶、重複文節は絶対に出力しないでください。コードの途中だった場合はインデントを維持してそのまま再開してください。\n\n"
+                        f"【直前の出力末尾】\n{last_context}"
                     )
 
                     contents_cont = [
@@ -281,13 +287,35 @@ if res:
                         f"### 直前までの全体出力\n{res['judge']}"
                     ]
 
-                    res_cont = call_gemini_with_smart_retry(contents_cont, sys_judge_continue, 0.2, status, use_search=False)
+                    res_cont = call_gemini_with_jitter_retry(contents_cont, sys_continue, 0.1, status, use_search=False)
 
-                    # 続きを結合して画面再更新
-                    st.session_state.discussion_result["judge"] += res_cont.text
-                    status.update(label="✅ 続きの生成が完了しました！", state="complete")
+                    # 高度な構文修復結合
+                    merged_result = merge_code_continuation(st.session_state.discussion_result["judge"], res_cont)
+                    st.session_state.discussion_result["judge"] = merged_result
+
+                    status.update(label="✅ 続きの生成とコード構造の修復が完了しました！", state="complete")
 
                 st.rerun()
 
             except Exception as e:
                 st.error(f"続きの生成中にエラーが発生しました: {e}")
+
+    # ディベートプロセスの確認用UI
+    st.markdown("---")
+    st.header("🗣️ 議論プロセス詳細")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if "proposer" in res:
+            with st.expander("💡 提案役の主張", expanded=False):
+                st.markdown(res["proposer"])
+
+        if "rebutter" in res:
+            with st.expander("↩️ 反論・解決案 (提案役側)", expanded=False):
+                st.markdown(res["rebutter"])
+
+    with col2:
+        if "critic" in res:
+            with st.expander("⚡ 批判役の指摘", expanded=False):
+                st.markdown(res["critic"])
