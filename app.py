@@ -1,4 +1,5 @@
 from datetime import datetime
+import io
 import os
 import random
 import re
@@ -20,7 +21,7 @@ st.set_page_config(
 
 st.title("🤖 AIマルチエージェント討論システム (Gemini 3.6 Flash高信頼版)")
 st.caption(
-    "💡提案役 vs ⚡批判役 vs ↩️反論役 vs 🏆審判役 | 自動リカバリ＆完全コード生成機能搭載"
+    "💡提案役 ➔ ⚡批判役 ➔ ↩️反論役 ➔ 🏆審判役 | リアルタイム対話QA＆コード自動修復機能搭載"
 )
 
 # --------------------------------------------------
@@ -47,6 +48,8 @@ with st.sidebar:
     if st.button("🗑️ 画面と全履歴をリセット", use_container_width=True):
         st.session_state.discussion_result = {}
         st.session_state.topic_used = ""
+        st.session_state.saved_image = None
+        st.session_state.chat_history = []
         st.rerun()
 
 if not api_key:
@@ -55,6 +58,16 @@ if not api_key:
 
 # GenAI クライアントの初期化
 client = genai.Client(api_key=api_key)
+
+# セッション状態の初期化
+if "discussion_result" not in st.session_state:
+    st.session_state.discussion_result = {}
+if "topic_used" not in st.session_state:
+    st.session_state.topic_used = ""
+if "saved_image" not in st.session_state:
+    st.session_state.saved_image = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 # --------------------------------------------------
 # 3. ユーティリティ関数（堅牢なエラー処理・ジッター・補正）
@@ -73,7 +86,7 @@ def call_gemini_with_jitter_retry(
     contents,
     system_instruction: str,
     temperature: float,
-    status_container,
+    status_container=None,
     use_search: bool = False,
     max_retries: int = 5,
     base_wait: float = 2.0,
@@ -109,16 +122,17 @@ def call_gemini_with_jitter_retry(
             if any(code in error_msg for code in ["429", "RESOURCE_EXHAUSTED", "500", "502", "503", "504"]):
                 if attempt == max_retries - 1:
                     raise e
-                # フルジッター付き指数バックオフ計算
                 exp_wait = min(max_wait, base_wait * (2 ** attempt))
                 actual_wait = random.uniform(1.0, exp_wait)
 
-                status_container.warning(
-                    f"⚠️ API混雑/制限を検知（試行 {attempt+1}/{max_retries}）。"
-                    f"{actual_wait:.1f}秒後に自動リトライします..."
-                )
+                msg = f"⚠️ API混雑/制限を検知（試行 {attempt+1}/{max_retries}）。{actual_wait:.1f}秒後に自動リトライします..."
+                if status_container:
+                    status_container.warning(msg)
+                else:
+                    st.warning(msg)
                 time.sleep(actual_wait)
-                status_container.info("🔄 処理を再開します...")
+                if status_container:
+                    status_container.info("🔄 処理を再開します...")
             else:
                 raise e
         except Exception as e:
@@ -128,7 +142,6 @@ def merge_code_continuation(original_text: str, continuation_text: str) -> str:
     """途切れ生成されたコードやテキストを自然に結合・構文修復する"""
     clean_continuation = continuation_text.strip()
 
-    # 続きのテキストが ```python や ``` で始まっている場合の重複削除調整
     if clean_continuation.startswith("```"):
         lines = clean_continuation.split("\n")
         if len(lines) > 1:
@@ -136,7 +149,6 @@ def merge_code_continuation(original_text: str, continuation_text: str) -> str:
 
     merged = original_text.rstrip() + "\n" + clean_continuation
 
-    # マークダウンコードブロックの閉じ漏れ補正（奇数個の場合は閉じる）
     backtick_count = merged.count("```")
     if backtick_count % 2 != 0:
         merged += "\n```"
@@ -163,12 +175,6 @@ if uploaded_file is not None:
     processed_image = compress_image(raw_image)
     st.image(processed_image, caption="添付画像（最適化済み）", width=250)
 
-# セッション状態の初期化
-if "discussion_result" not in st.session_state:
-    st.session_state.discussion_result = {}
-if "topic_used" not in st.session_state:
-    st.session_state.topic_used = ""
-
 # --------------------------------------------------
 # 5. 討論実行ロジック (段階的保存・状態保持対応)
 # --------------------------------------------------
@@ -179,7 +185,9 @@ if st.button("🚀 最新情報を検索して討論＆コード生成を開始"
         st.warning("テーマを入力するか、画像をアップロードしてください。")
     else:
         st.session_state.topic_used = topic
-        st.session_state.discussion_result = {}  # 初期化
+        st.session_state.saved_image = processed_image
+        st.session_state.discussion_result = {}
+        st.session_state.chat_history = []
 
         try:
             with st.status("🤖 AIエージェントたちが検証・ディベート中...", expanded=True) as status:
@@ -255,21 +263,37 @@ if st.button("🚀 最新情報を検索して討論＆コード生成を開始"
             st.info("💡 途中のフェーズまで実行結果が生成されている場合、下部に表示されています。")
 
 # --------------------------------------------------
-# 6. 討論結果のUI描画および自動復元・補完機能
+# 6. 討論結果のUI描画（完全時系列順表示：提案 ➔ 批判 ➔ 反論 ➔ 審判）
 # --------------------------------------------------
 res = st.session_state.discussion_result
 
 if res:
+    # --- 議論プロセスの表示 (時系列順: 1.提案 → 2.批判 → 3.反論) ---
+    st.markdown("---")
+    st.header("🗣️ AIディベートプロセス (時系列)")
+
+    if "proposer" in res:
+        with st.expander("1. 💡 【提案役】の主張", expanded=True):
+            st.markdown(res["proposer"])
+
+    if "critic" in res:
+        with st.expander("2. ⚡ 【批判役】の指摘・リスク検証", expanded=True):
+            st.markdown(res["critic"])
+
+    if "rebutter" in res:
+        with st.expander("3. ↩️ 【反論役】の反論・改善策", expanded=True):
+            st.markdown(res["rebutter"])
+
+    # --- 審判役の最終結論および完全コード ---
     if "judge" in res:
         st.markdown("---")
         st.header("🏆 審判役の最終結論・コピペ用成果物")
-        st.info("💡 ユーザーの要望に基づき統合された最終成果物・コードです。そのままコピーして利用可能です。")
+        st.info("💡 議論を統合した最終成果物です。コードが必要な場合は下に完全なコードが出力されます。")
 
         with st.container(border=True):
             st.markdown(res["judge"])
 
-        # コード途切れ時の精密補完UI
-        st.markdown("---")
+        # コード途切れ時の補完UI
         if st.button("📝 コードや結論が途中で切れている場合、続きを生成して自動結合する"):
             try:
                 with st.status("🔄 審判役の続きを生成し、構文修復中...", expanded=True) as status:
@@ -288,8 +312,6 @@ if res:
                     ]
 
                     res_cont = call_gemini_with_jitter_retry(contents_cont, sys_continue, 0.1, status, use_search=False)
-
-                    # 高度な構文修復結合
                     merged_result = merge_code_continuation(st.session_state.discussion_result["judge"], res_cont)
                     st.session_state.discussion_result["judge"] = merged_result
 
@@ -300,22 +322,58 @@ if res:
             except Exception as e:
                 st.error(f"続きの生成中にエラーが発生しました: {e}")
 
-    # ディベートプロセスの確認用UI
-    st.markdown("---")
-    st.header("🗣️ 議論プロセス詳細")
+        # --------------------------------------------------
+        # 7. 審判役に対する追加質問・対話機能 (QAチャット)
+        # --------------------------------------------------
+        st.markdown("---")
+        st.header("💬 審判役への追加質問・条件変更")
+        st.caption("審判役の結論やコードに対して、追加の要望や修正指示（「エラーハンドリングを追加して」「非同期化して」など）を質疑応答できます。")
 
-    col1, col2 = st.columns(2)
+        # 過去のチャット履歴表示
+        for chat in st.session_state.chat_history:
+            with st.chat_message(chat["role"]):
+                st.markdown(chat["content"])
 
-    with col1:
-        if "proposer" in res:
-            with st.expander("💡 提案役の主張", expanded=False):
-                st.markdown(res["proposer"])
+        # チャット入力
+        user_query = st.chat_input("審判役に指示や追加質問を入力...")
 
-        if "rebutter" in res:
-            with st.expander("↩️ 反論・解決案 (提案役側)", expanded=False):
-                st.markdown(res["rebutter"])
+        if user_query:
+            # ユーザーの質問を表示＆保存
+            st.session_state.chat_history.append({"role": "user", "content": user_query})
+            with st.chat_message("user"):
+                st.markdown(user_query)
 
-    with col2:
-        if "critic" in res:
-            with st.expander("⚡ 批判役の指摘", expanded=False):
-                st.markdown(res["critic"])
+            # AI（審判役）の回答生成
+            with st.chat_message("assistant"):
+                with st.spinner("🤖 審判役が追加質問を分析・コードを再構築中..."):
+                    sys_chat_judge = (
+                        "あなたは最高権威の審判役兼リードアーキテクトです。\n"
+                        "ユーザーから提出された追加質問や指示に対し、これまでの議論と直前の成果物を踏まえて回答してください。\n\n"
+                        "【絶対遵守ルール】\n"
+                        "1. ユーザーがコードの修正や機能追加を求めている場合、変更点のみの提示で終わらせず、**必ず途中省略なしでそのままコピペして動く全体コード**をコードブロック（```python等）で再出力してください。\n"
+                        "2. 「...（既存コードと同じ）」などの省略表記は絶対に禁止です。"
+                    )
+
+                    # チャット履歴の構築
+                    history_str = ""
+                    for h in st.session_state.chat_history[:-1]:
+                        role_name = "ユーザー" if h["role"] == "user" else "審判役"
+                        history_str += f"\n【{role_name}】\n{h['content']}\n"
+
+                    prompt_contents = []
+                    if st.session_state.saved_image:
+                        prompt_contents.append(st.session_state.saved_image)
+
+                    prompt_contents.append(
+                        f"### 当初の目的・テーマ\n{st.session_state.topic_used}\n\n"
+                        f"### 審判役の初期結論・成果物\n{st.session_state.discussion_result['judge']}\n\n"
+                        f"### 過去の追加質問履歴\n{history_str if history_str else 'なし'}\n\n"
+                        f"### 今回のユーザーからの追加指示・質問\n{user_query}"
+                    )
+
+                    try:
+                        ans_text = call_gemini_with_jitter_retry(prompt_contents, sys_chat_judge, 0.2, use_search=False)
+                        st.markdown(ans_text)
+                        st.session_state.chat_history.append({"role": "assistant", "content": ans_text})
+                    except Exception as e:
+                        st.error(f"追加質問への回答中にエラーが発生しました: {e}")
