@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import tempfile
 import time
 import uuid
 from google import genai
@@ -30,7 +31,7 @@ HISTORY_FILE = "discussion_history.json"
 MAX_HISTORY_COUNT = 10  # メモリ・ストレージ保護のための最大保持件数
 
 # --------------------------------------------------
-# 2. ローカルJSONファイル操作関数 (コスト0円永続化)
+# 2. ローカルJSONファイル操作関数 (アトミック書き込み＆堅牢化)
 # --------------------------------------------------
 def load_history_from_file() -> dict:
     """ローカルJSONファイルから過去ログを読み込む"""
@@ -38,22 +39,37 @@ def load_history_from_file() -> dict:
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            st.error(f"履歴読み込みエラー: {e}")
             return {}
     return {}
 
 def save_history_to_file(history_data: dict):
-    """ローカルJSONファイルへ過去ログを書き出す (上限件数制御付き)"""
+    """
+    ローカルJSONファイルへ過去ログを書き出す
+    - 上限件数制御 (FIFO: 新しい順にMAX_HISTORY_COUNT件を保持)
+    - アトミック書き込みによるファイル破損防止
+    - メモリ(session_state)との完全同期
+    """
     try:
-        # 件数制限 (FIFO: 新しい順にMAX_HISTORY_COUNT件を保持)
+        # 件数制限 (新しい順に並べ替えて最新件数のみ抽出)
         sorted_keys = sorted(
             history_data.keys(),
             key=lambda k: history_data[k].get("timestamp", ""),
             reverse=True
         )
         trimmed_data = {k: history_data[k] for k in sorted_keys[:MAX_HISTORY_COUNT]}
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(trimmed_data, f, ensure_ascii=False, indent=2)
+
+        # 1. メモリ領域 (st.session_state) 側のデータも最新のトリミング状態に更新
+        st.session_state.history_store = trimmed_data
+
+        # 2. アトミック書き込み (一時ファイル作成後に置換することで書き込み事故を完全防止)
+        dir_name = os.path.dirname(HISTORY_FILE) or "."
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=dir_name, encoding="utf-8") as tf:
+            json.dump(trimmed_data, tf, ensure_ascii=False, indent=2)
+            temp_name = tf.name
+
+        os.replace(temp_name, HISTORY_FILE)
     except Exception as e:
         st.error(f"履歴保存エラー: {e}")
 
@@ -86,14 +102,13 @@ with st.sidebar:
     if selected_model == "カスタム入力":
         selected_model = st.text_input("モデル名を入力:", value="gemini-3.6-flash")
 
-    # --- 📜 過去ログ切り替え (0円永続化 & ID管理) ---
+    # --- 📜 過去ログ切り替え ---
     st.markdown("---")
     st.subheader("📜 過去の討論履歴")
 
     history_store = st.session_state.history_store
     options = ["-- 新規作成 / 最新表示 --"]
 
-    # タイムスタンプ降順でリスト化
     sorted_session_ids = sorted(
         history_store.keys(),
         key=lambda k: history_store[k].get("timestamp", ""),
@@ -115,7 +130,18 @@ with st.sidebar:
         if st.session_state.active_session_id not in history_store:
             st.session_state.active_session_id = None
 
+    # バックアップ（ダウンロード）機能の追加
     st.markdown("---")
+    if history_store:
+        json_string = json.dumps(history_store, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="💾 全履歴をJSONでバックアップ",
+            data=json_string,
+            file_name=f"discussion_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
     if st.button("🗑️ 画面と全履歴を完全に消去", use_container_width=True):
         st.session_state.history_store = {}
         st.session_state.active_session_id = None
@@ -297,7 +323,7 @@ if st.button("🚀 ディベートを開始し、最適解・成果物を生成"
                 contents_p4 = [f"### 【ユーザーの当初の目的・要望】\n{topic}\n\n### 【提案役の主張】\n{current_res['proposer']}\n\n### 【批判役の指摘】\n{current_res['critic']}\n\n### 【反論・解決案】\n{current_res['rebutter']}\n\n--- 命令 ---\n上記の議論成果を統合し、ユーザーの要求を満たす最終成果物を出力してください。"]
                 current_res["judge"] = call_gemini_with_jitter_retry(contents_p4, sys_judge, 0.2, status, use_search=False)
 
-                # セッション構造の作成とJSON保存 (APIコストなし永続化)
+                # セッション構造の作成とJSON保存
                 now_dt = datetime.now()
                 session_data = {
                     "timestamp": now_dt.isoformat(),
@@ -317,7 +343,7 @@ if st.button("🚀 ディベートを開始し、最適解・成果物を生成"
             st.error(f"実行中にエラーが発生しました: {e}")
 
 # --------------------------------------------------
-# 8. 討論結果 UI (デフォルト折りたたみ & 完全個別ID連携)
+# 8. 討論結果 UI (折りたたみ表示 & 各種機能)
 # --------------------------------------------------
 active_id = st.session_state.active_session_id
 active_data = st.session_state.history_store.get(active_id) if active_id else None
@@ -330,7 +356,6 @@ if active_data:
     st.header(f"🗣️ AIディベートプロセス (テーマ: {topic_used[:30]}...)")
     st.caption("💡 スクロール量を削減するため、提案・批判・反論はデフォルトで折りたたんでいます。タップで開閉可能です。")
 
-    # 初期状態を expanded=False に指定（スクロール長を劇的に削減）
     if "proposer" in res:
         with st.expander("1. 💡 【提案役】の主張を見る", expanded=False):
             st.markdown(res["proposer"])
@@ -343,7 +368,6 @@ if active_data:
         with st.expander("3. ↩️ 【反論役】の反論・改善策を見る", expanded=False):
             st.markdown(res["rebutter"])
 
-    # メインの最終成果物
     if "judge" in res:
         st.markdown("---")
         st.header("🏆 審判役の最終結論・最終成果物")
@@ -363,7 +387,6 @@ if active_data:
                     res_cont = call_gemini_with_jitter_retry(contents_cont, sys_continue, 0.1, status)
                     merged = merge_code_continuation(res["judge"], res_cont)
 
-                    # アクティブセッション側のみを正確に更新
                     st.session_state.history_store[active_id]["result"]["judge"] = merged
                     save_history_to_file(st.session_state.history_store)
                     status.update(label="✅ 補完完了！", state="complete")
@@ -372,14 +395,13 @@ if active_data:
                 st.error(f"エラー: {e}")
 
         # --------------------------------------------------
-        # 9. 追加質問・QA機能（マルチターン文脈維持＆ID完全同期）
+        # 9. 追加質問・QA機能（マルチターン文脈維持）
         # --------------------------------------------------
         st.markdown("---")
         st.header("💬 審判役への追加質問・修正指示")
 
         chat_history = active_data.get("chat_history", [])
 
-        # チャット履歴の描画
         for chat in chat_history:
             with st.chat_message(chat["role"]):
                 st.markdown(chat["content"])
@@ -387,7 +409,6 @@ if active_data:
         user_query = st.chat_input("審判役に指示や追加質問を入力...")
 
         if user_query:
-            # ユーザーの質問を追加
             chat_history.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
@@ -400,7 +421,6 @@ if active_data:
                         "※成果物の修正・改訂を求められた場合は、途中で省略せず完全な改訂成果物を提示してください。"
                     )
 
-                    # 対話コンテキストの構築 (マルチターン補強)
                     history_context_str = ""
                     for h in chat_history[:-1]:
                         role_label = "ユーザー" if h["role"] == "user" else "審判役"
@@ -418,7 +438,6 @@ if active_data:
                         st.markdown(ans_text)
                         chat_history.append({"role": "assistant", "content": ans_text})
 
-                        # アクティブなセッションIDのデータのみを正確に更新・ファイル保存
                         st.session_state.history_store[active_id]["chat_history"] = chat_history
                         save_history_to_file(st.session_state.history_store)
                     except Exception as e:
