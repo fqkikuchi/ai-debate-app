@@ -1,6 +1,5 @@
 from datetime import datetime
 import os
-import re
 import time
 from google import genai
 from google.genai import types
@@ -33,7 +32,7 @@ with st.sidebar:
         api_key = st.text_input("Gemini API Key を入力してください:", type="password")
         st.caption("[Google AI Studio](https://aistudio.google.com/) で取得可能です。")
 
-    # 使用モデルの設定（デフォルトを gemini-3.6-flash に設定）
+    # 使用モデルの設定
     selected_model = st.selectbox(
         "使用モデル",
         ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash", "カスタム入力"],
@@ -72,7 +71,6 @@ def call_gemini_with_smart_retry(
 ):
     """Google検索ツール（グラウンディング）と自動リトライを統合したAPIコール関数"""
     
-    # AIの知識古化・事実誤認を防ぐため、現在の年月日と最新前提をシステム指示に自動付与
     current_date = datetime.now().strftime("%Y年%m月%d日")
     context_header = (
         f"【最重要前提】本日は {current_date} です。"
@@ -81,13 +79,12 @@ def call_gemini_with_smart_retry(
     )
     full_system_instruction = context_header + system_instruction
 
-    # Google検索をツールとして定義
     search_tool = types.Tool(google_search=types.GoogleSearch())
     
     config = types.GenerateContentConfig(
         system_instruction=full_system_instruction,
         temperature=temperature,
-        max_output_tokens=2000,
+        max_output_tokens=8192,  # 💡ここでトークン上限を最大値に解放しています
         tools=[search_tool],
     )
     
@@ -134,6 +131,7 @@ if uploaded_file is not None:
 
 if "discussion_result" not in st.session_state:
     st.session_state.discussion_result = None
+    st.session_state.topic_used = ""
 
 # --------------------------------------------------
 # 5. 討論実行ロジック
@@ -150,7 +148,7 @@ if st.button("🚀 最新情報を検索して討論を開始", type="primary", 
                 expanded=True,
             ) as status:
                 
-                BASE_WAIT = 10  # リトライ回避用の標準インターバル
+                BASE_WAIT = 10
 
                 # --- PHASE 1: 提案役 ---
                 status.write("1/4 💡 【提案役】Web検索で最新事実を調査し、主張を構築中...")
@@ -215,6 +213,7 @@ if st.button("🚀 最新情報を検索して討論を開始", type="primary", 
                 judge_text = res_p4.text
 
                 # セッションへ保存
+                st.session_state.topic_used = topic
                 st.session_state.discussion_result = {
                     "proposer": proposer_text,
                     "critic": critic_text,
@@ -228,7 +227,7 @@ if st.button("🚀 最新情報を検索して討論を開始", type="primary", 
             st.error(f"エラーが発生しました: {e}")
 
 # --------------------------------------------------
-# 6. 結果の描画 UI
+# 6. 結果の描画 UI と 審判役の続き生成機能
 # --------------------------------------------------
 if st.session_state.discussion_result:
     res = st.session_state.discussion_result
@@ -256,3 +255,37 @@ if st.session_state.discussion_result:
     st.header("🏆 審判役の最終結論")
     with st.container(border=True):
         st.write(res["judge"])
+
+    # 💡 審判役の出力が途切れた場合の追加生成ボタン
+    st.markdown("---")
+    if st.button("📝 審判役の結論が途切れている場合、続きを生成する"):
+        try:
+            with st.status("🔄 審判役の続きを生成しています...", expanded=True) as status:
+                
+                # 直前の文章の末尾数文字を取得して文脈として渡す
+                last_text = res["judge"][-300:] if len(res["judge"]) > 300 else res["judge"]
+                
+                sys_judge_continue = (
+                    "あなたは客観的な審判役です。先ほどの出力がトークン制限により途中で切れてしまいました。\n"
+                    "以下の【出力済みのテキスト】の続きから、残りの結論を出力してください。\n"
+                    "※挨拶や重複する内容は書かず、完全に続きの文章から書き始めてください。\n\n"
+                    f"【出力済みのテキスト】\n{last_text}"
+                )
+                
+                contents_cont = [
+                    f"### テーマ\n{st.session_state.topic_used}\n\n"
+                    f"### 提案\n{res['proposer']}\n\n"
+                    f"### 批判\n{res['critic']}\n\n"
+                    f"### 反論・解決策\n{res['rebutter']}"
+                ]
+                
+                res_cont = call_gemini_with_smart_retry(contents_cont, sys_judge_continue, 0.4, status)
+                
+                # 続きのテキストを結合して再描画
+                st.session_state.discussion_result["judge"] += "\n\n" + res_cont.text
+                status.update(label="✅ 続きの生成が完了しました！", state="complete")
+                
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"エラーが発生しました: {e}")
