@@ -150,21 +150,14 @@ client = genai.Client(api_key=api_key)
 # 5. ユーティリティ関数
 # --------------------------------------------------
 def call_gemini_optimized(contents, system_instruction: str, temperature: float, use_search: bool = False, max_retries: int = 5):
-    """省トークン・超堅牢リトライ機能付きAPI呼出 (文字数上限を最大8192へ拡大)"""
+    """省トークン・超堅牢リトライ機能付きAPI呼出"""
     current_date = datetime.now().strftime("%Y年%m月%d日")
     full_system = (
         f"【最重要前提】本日は {current_date} です。最新の仕様・ファクトに基づき客観的かつ論理的に思考してください。\n\n"
         + system_instruction
     )
     tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else None
-    
-    # max_output_tokens を 4096 から 最大上限の 8192 へ引き上げ
-    config = types.GenerateContentConfig(
-        system_instruction=full_system,
-        temperature=temperature,
-        max_output_tokens=8192,
-        tools=tools
-    )
+    config = types.GenerateContentConfig(system_instruction=full_system, temperature=temperature, max_output_tokens=4096, tools=tools)
 
     for attempt in range(max_retries):
         try:
@@ -278,6 +271,21 @@ elif st.session_state.current_step == "GENERATING_JUDGE":
         add_msg("judge", "審判役", judge_res, "🏆")
 
     st.session_state.current_step = "JUDGE_DONE"
+
+    # --- 履歴の保存処理をここに追加 ---
+    if st.session_state.active_session_id is None:
+        st.session_state.active_session_id = str(uuid.uuid4())
+        
+    session_id = st.session_state.active_session_id
+    st.session_state.history_store[session_id] = {
+        "timestamp": datetime.now().isoformat(),
+        "time_label": datetime.now().strftime("%m/%d %H:%M"),
+        "topic": st.session_state.topic,
+        "messages": st.session_state.debate_messages
+    }
+    save_history_to_file(st.session_state.history_store)
+    # ---------------------------------
+
     st.rerun()
 
 # --------------------------------------------------
@@ -303,8 +311,7 @@ if st.session_state.current_step == "JUDGE_DONE":
                     "あなたは先ほどの討論の「審判役」です。自身の出した結論とこれまでの討論内容を踏まえ、"
                     "ユーザーからの追加質問や作業依頼に対応してください。\n"
                     "「コードを書いて」「ドキュメント形式でまとめて」などの要求があった場合は、"
-                    "これまでの議論の経緯や結論の要素を最大限に反映し、指定されたフォーマットで高精度な出力を行ってください。\n"
-                    "【注意】ソースコードの作成を依頼された場合は前置きの解説を最小限にし、プログラム全文を途中で省略・途切れさせずに最後まで書ききってください。"
+                    "これまでの議論の経緯や結論の要素を最大限に反映し、指定されたフォーマットで高精度な出力を行ってください。"
                 )
                 qa_prompt = get_discussion_context() + f"【ユーザーからの追加質問・作成依頼】\n{user_q}"
                 
