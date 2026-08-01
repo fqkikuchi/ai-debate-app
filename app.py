@@ -233,4 +233,156 @@ def merge_code_continuation(original_text: str, continuation_text: str) -> str:
         if len(lines) > 1:
             clean_continuation = "\n".join(lines[1:])
 
-    merged
+   def merge_code_continuation(original_text: str, continuation_text: str) -> str:
+    """途切れ生成された文章やコードを結合し、Markdown構造を修復"""
+    clean_continuation = continuation_text.strip()
+    if clean_continuation.startswith("```"):
+        lines = clean_continuation.split("\n")
+        if len(lines) > 1:
+            clean_continuation = "\n".join(lines[1:])
+            
+    return original_text + "\n" + clean_continuation
+
+# --------------------------------------------------
+# 6. 状態管理（チャット履歴用）
+# --------------------------------------------------
+if "debate_messages" not in st.session_state:
+    st.session_state.debate_messages = []
+if "judge_qa_messages" not in st.session_state:
+    st.session_state.judge_qa_messages = []
+if "topic" not in st.session_state:
+    st.session_state.topic = ""
+
+# --------------------------------------------------
+# 7. メイン画面：設定と討論実行
+# --------------------------------------------------
+st.subheader("🗣️ 討論テーマの設定")
+topic_input = st.text_area(
+    "討論したいテーマや質問を入力してください:",
+    placeholder="例: リモートワークは週5日出社に戻すべきか？",
+    height=80
+)
+
+# 【要件1】反論役を挟むかどうかの選択スイッチ
+route_choice = st.radio(
+    "🛤️ 討論の進行ルートを選択してください:",
+    [
+        "1️⃣ 提案 ➔ 批判 ➔ 🏆審判 (標準・スピーディ)", 
+        "2️⃣ 提案 ➔ 批判 ➔ ↩️反論 ➔ 🏆審判 (徹底討論)"
+    ],
+    index=0,
+    horizontal=True
+)
+include_rebuttal = "徹底討論" in route_choice
+
+# 実行ボタン
+if st.button("🚀 討論を開始する", type="primary", use_container_width=True):
+    if not topic_input.strip():
+        st.warning("⚠️ テーマを入力してください。")
+    else:
+        # 新規討論のためにステートをリセット
+        st.session_state.debate_messages = []
+        st.session_state.judge_qa_messages = []
+        st.session_state.current_step = "GENERATING"
+        st.session_state.topic = topic_input
+
+# --------------------------------------------------
+# 8. 討論生成ロジック
+# --------------------------------------------------
+if st.session_state.current_step == "GENERATING":
+    # 検索機能のオンオフ判定（サイドバーの選択を利用）
+    use_search_flag = False if "常に無効" in enable_search_option else True
+
+    def add_msg(role, name, text, icon):
+        st.session_state.debate_messages.append({"role": role, "name": name, "text": text, "icon": icon})
+
+    st.markdown("---")
+    st.info("🔄 討論を進行しています...（少々お待ちください）")
+    
+    # 1. 提案役のターン
+    with st.spinner("💡 提案役が意見を構築中..."):
+        prop_sys = "あなたは「提案役」です。与えられたテーマに対し、論理的で説得力のある賛成・推進の立場からの意見を明確に述べてください。"
+        prop_res = call_gemini_optimized(st.session_state.topic, prop_sys, 0.7, use_search=use_search_flag)
+        add_msg("proposer", "提案役", prop_res, "💡")
+
+    # 2. 批判役のターン
+    with st.spinner("⚡ 批判役が問題点を指摘中..."):
+        crit_sys = "あなたは「批判役」です。提案役の意見を分析し、隠れたリスク、矛盾、または現実的な問題点を鋭く論理的に指摘してください。"
+        crit_prompt = f"【テーマ】: {st.session_state.topic}\n\n【提案役の意見】:\n{prop_res}"
+        crit_res = call_gemini_optimized(crit_prompt, crit_sys, 0.7, use_search=use_search_flag)
+        add_msg("critic", "批判役", crit_res, "⚡")
+
+    rebuttal_res = ""
+    # 3. 反論役のターン（スイッチでONの場合のみ実行）
+    if include_rebuttal:
+        with st.spinner("↩️ 反論役が再反論を構築中..."):
+            reb_sys = "あなたは「反論役」です。批判役の指摘を真摯に受け止めた上で、それを論理的に防御・解決し、提案の価値を再提示してください。"
+            reb_prompt = f"【テーマ】: {st.session_state.topic}\n\n【提案】:\n{prop_res}\n\n【批判】:\n{crit_res}"
+            rebuttal_res = call_gemini_optimized(reb_prompt, reb_sys, 0.7, use_search=use_search_flag)
+            add_msg("rebuttal", "反論役", rebuttal_res, "↩️")
+
+    # 4. 審判役のターン
+    with st.spinner("🏆 審判役が最終結論を作成中..."):
+        judge_sys = "あなたは「審判役」です。これまでの議論を客観的かつ公平に評価し、最終的な結論と、両者の優れた点・今後の課題を分かりやすくまとめてください。"
+        judge_prompt = f"【テーマ】: {st.session_state.topic}\n\n【提案】:\n{prop_res}\n\n【批判】:\n{crit_res}\n\n"
+        if include_rebuttal:
+            judge_prompt += f"【反論】:\n{rebuttal_res}\n\n"
+        judge_res = call_gemini_optimized(judge_prompt, judge_sys, 0.7, use_search=use_search_flag)
+        add_msg("judge", "審判役", judge_res, "🏆")
+
+    # 進行ステータスを完了に変更して画面をリロード
+    st.session_state.current_step = "JUDGE_DONE"
+    st.rerun()
+
+# --------------------------------------------------
+# 9. 討論結果の表示と追加質問チャット
+# --------------------------------------------------
+if st.session_state.current_step == "JUDGE_DONE" and st.session_state.debate_messages:
+    st.markdown("---")
+    st.subheader("📜 討論記録")
+    
+    # 討論履歴の描画
+    for msg in st.session_state.debate_messages:
+        with st.chat_message(msg["role"], avatar=msg["icon"]):
+            st.markdown(f"**{msg['name']}**")
+            st.write(msg["text"])
+
+    st.markdown("---")
+    
+    # 【要件2】審判役への追加質問チャット
+    st.subheader("❓ 審判役への追加質問")
+    st.caption("出された結論について、気になる点や深掘りしたいことを審判役にチャット形式で質問できます。")
+
+    # これまでのQA履歴を表示
+    for qa in st.session_state.judge_qa_messages:
+        with st.chat_message(qa["role"], avatar=qa["icon"]):
+            st.write(qa["text"])
+
+    # チャット入力欄
+    if user_q := st.chat_input("審判役へ質問を入力してください..."):
+        # ユーザーの質問を保存・表示
+        st.session_state.judge_qa_messages.append({"role": "user", "text": user_q, "icon": "👤"})
+        with st.chat_message("user", avatar="👤"):
+            st.write(user_q)
+
+        # 審判役に質問を投げて回答を生成
+        with st.chat_message("judge", avatar="🏆"):
+            with st.spinner("審判役が思考中..."):
+                qa_sys = (
+                    "あなたは先ほどの討論の「審判役」です。自身の出した結論とこれまでの討論内容を踏まえ、"
+                    "ユーザーからの追加質問に客観的かつ論理的に答えてください。"
+                )
+                
+                # これまでの文脈を構築
+                context = f"【テーマ】{st.session_state.topic}\n\n【討論記録】\n"
+                for m in st.session_state.debate_messages:
+                    context += f"{m['name']}: {m['text']}\n"
+                context += f"\n【ユーザーからの追加質問】\n{user_q}"
+
+                # 回答の生成
+                use_search_flag = False if "常に無効" in enable_search_option else True
+                qa_res = call_gemini_optimized(context, qa_sys, 0.7, use_search=use_search_flag)
+                st.write(qa_res)
+                
+        # 審判の回答を保存
+        st.session_state.judge_qa_messages.append({"role": "judge", "text": qa_res, "icon": "🏆"})
